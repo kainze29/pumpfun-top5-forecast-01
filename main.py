@@ -15,7 +15,17 @@ Method (stdlib only, fully deterministic, seeded Monte Carlo):
     last read were born after the cut). They are simulated as synthetic
     newcomers: launch rate and peak-cap tail fitted from the history's
     own launches, launched uniformly between the cut and each answer
-    read, rising fast to a peak then bleeding off.
+    read, rising fast to a peak then bleeding off. The launch rate
+    is NOT the raw count of big peaks divided by the window: on a
+    minutes-long window that count is heavily censored (a coin needs
+    ~10-30 min to reach its peak), so a short window gets a x3.0
+    censoring inflation, while a long window uses a mature-cohort
+    estimator (launch rate from the recorder's eligible counts times
+    the share of coins launched >=30 min ago that ever peaked
+    >=100 SOL). The peak tail mixes the history's own mature peaks
+    with an exponential tail (mean 0.8 in log10): among mature coins
+    the mean excess over 100 SOL is ~0.7 and 35% of big coins exceed
+    1,000 SOL.
   * One seeded Monte Carlo ranks known coins + synthetic newcomers at
     each of the seven answer reads; place frequencies become the
     probabilities (the residual mass is left unnamed, which is exactly
@@ -33,7 +43,7 @@ import random
 from datetime import datetime, timezone
 
 SEED = 20261112
-N_TRIALS = 1200
+N_TRIALS = 3600
 MAX_CANDIDATES = 220
 MAX_NEWCOMERS_PER_READ = 400
 EMIT_P_MIN = 0.003
@@ -175,10 +185,55 @@ def main():
         peak = max(l for _, l in c["obs"])
         launches.append(peak)
     big_peaks = sorted(p for p in launches if p >= 2.0)
-    span_h = (max((t_last - t0).total_seconds() / 3600.0, 0.5)
+    span_h = (max((t_last - t0).total_seconds() / 3600.0, 0.2)
               if t0 is not None else 1.0)
-    rate_big = 1.5 * len(big_peaks) / span_h  # x1.5: coins launched late
-    # in the window are censored, their peaks not yet observed
+    # Short-window fallback: peaks observed over minutes are heavily
+    # censored (time-to-peak median ~10 min, 75th percentile ~20 min),
+    # so the raw big-peak count understates the true launch rate of
+    # >=100 SOL coins by roughly 3x. The 0.2h floor keeps the rate
+    # finite on a 10-minute history.
+    rate_big = 3.0 * len(big_peaks) / span_h
+    # Long-history estimator: launch rate from the recorder's eligible
+    # counts (slope over the last 2h of marks, else the full span)
+    # times the share of mature coins (launched >=30 min ago) that ever
+    # peaked >=100 SOL, with a small x1.3 residual-censoring correction.
+    # Validated on the practice: this predicts 38/h for the full 50-min
+    # window vs 35/h realised, while the raw-count estimators give
+    # 52/h (x1.5) to 105/h (x3.0). Used only when the mature cohort is
+    # big enough to trust; otherwise the fallback above applies.
+    try:
+        from datetime import timedelta as _td
+        _cutoff = t_last - _td(minutes=30)
+        _elig_cut = None
+        for _m in marks:
+            if parse_ts(_m["at"]) <= _cutoff:
+                _elig_cut = (_m.get("counts") or {}).get("eligible")
+        _big_mature = 0
+        for _c in series.values():
+            _created = _c["created"] or (_c["obs"][0][0] if _c["obs"] else None)
+            if _created is None or _created > _cutoff:
+                continue
+            if max(_l for _, _l in _c["obs"]) >= 2.0:
+                _big_mature += 1
+        _elig_pts = [(parse_ts(_m["at"]), (_m.get("counts") or {}).get("eligible"))
+                     for _m in marks]
+        _elig_pts = [(t, e) for t, e in _elig_pts if e]
+        _recent = [(t, e) for t, e in _elig_pts
+                   if (t_last - t).total_seconds() <= 2 * 3600.0]
+        if len(_recent) < 2:
+            _recent = _elig_pts
+        _launch_rate = 0.0
+        if len(_recent) >= 2:
+            _dt = (_recent[-1][0] - _recent[0][0]).total_seconds() / 3600.0
+            if _dt > 0:
+                _launch_rate = (_recent[-1][1] - _recent[0][1]) / _dt
+        elif len(_recent) == 1:
+            _launch_rate = _recent[0][1] / span_h
+        if (_elig_cut is not None and _elig_cut >= 100 and _big_mature >= 3
+                and _launch_rate > 0):
+            rate_big = _launch_rate * (_big_mature / _elig_cut) * 1.3
+    except Exception:
+        pass
     rate_big = clamp(rate_big, 5.0, 150.0)
 
     # ---- per-coin forecast parameters ------------------------------------
@@ -257,17 +312,16 @@ def main():
     def newcomer_peak():
         # Peak-cap tail of a newcomer (>= 100 SOL). Most draws come from
         # the history's own observed peaks (jittered); a minority from an
-        # exponential tail above 100 SOL (mean 0.4 in log10), because a
-        # short history censors peaks and a longer launch window breeds
-        # a somewhat bigger maximum than the observed one. The tail is
-        # kept modest on purpose: the house baseline's practice size
-        # score (-19.03, centred on the last mark's caps with sd 0.35)
-        # shows the true caps stayed within roughly a factor 2-3 of the
-        # last mark's, so a tail that routinely put place 1 at 25,000
-        # SOL would be dishonest, not bold.
+        # exponential tail above 100 SOL (mean 0.8 in log10). The mean
+        # is fitted, not guessed: among mature coins (launched >=15 min
+        # before the last mark) the mean excess over 100 SOL is ~0.7 and
+        # 35% of big coins exceed 1,000 SOL, so a mean-0.4 tail would
+        # understate the winners. The cap at 10^5.5 SOL bounds the
+        # extreme draw; a routine place-1 forecast near there would need
+        # many more launches than one day holds.
         if big_peaks and rng.random() < 0.6:
             return rng.choice(big_peaks) + rng.uniform(-0.05, 0.05)
-        return min(2.0 + rng.expovariate(1.0 / 0.4), 4.8)
+        return min(2.0 + rng.expovariate(1.0 / 0.8), 5.5)
 
     # ---- Monte Carlo ------------------------------------------------------
     rng = random.Random(SEED)
